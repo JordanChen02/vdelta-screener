@@ -1,58 +1,80 @@
+# src/views/screener.py
 from __future__ import annotations
 
 import streamlit as st
 import pandas as pd
 
 from src.data.load import load_prices
-from src.features.deltas import compute_vdelta
+from src.data.mcap import MCAP_USD
+from src.features.deltas import compute_vdelta, normalize_by_mcap
 from src.charts.vol_delta_bar import vol_delta_top_bar
 
 
 def render_screener() -> None:
-    st.header("Screener")
+    st.header("Rotation Screener (proxy vΔ)")
 
-    # Sidebar controls
+    # ───────── Sidebar controls ─────────
     with st.sidebar:
         st.subheader("Controls")
         symbols_text = st.text_input("Symbols (comma-separated)", "BTC,ETH,SOL")
         timeframe = st.selectbox("Timeframe", ["5m", "15m", "1h"], index=1)
         top_n = st.number_input("Top-N", min_value=3, max_value=50, value=10, step=1)
+        rank_mode = st.radio("Rank by", ["Raw (vol_delta)", "Normalized (vol_delta_norm)"], index=0)
         refresh = st.button("Refresh")
 
-    # Refresh clears cached data loaders
+    # Clear cached data on demand
     if refresh:
         try:
             st.cache_data.clear()
         except Exception:
             pass
 
-    # Load data (stub for now)
-    df = load_prices(None)  # your loader should return columns: timestamp, symbol, close, volume
+    # ───────── Load mock data ─────────
+    df = load_prices(None)  # expects: timestamp, symbol, close, volume
 
-    # Guard if nothing loaded
     if df is None or df.empty or not {"symbol", "timestamp", "volume"}.issubset(df.columns):
-        st.info("No data loaded yet. CSV/Live source will be wired next.")
+        st.info("No data loaded yet. Add rows to data/mock_prices.csv")
         return
 
-    # Compute vol_delta
-    df = compute_vdelta(df)
+    # ───────── Compute proxy vΔ (pct-change of volume) ─────────
+    df = compute_vdelta(df)  # adds 'vol_delta'
 
-    # Show latest row per symbol
+    # ───────── Normalize by market cap ─────────
+    # Map CSV symbols (BTC→BTCUSDT, etc.) to the MCAP dictionary keys
+    df_norm = df.assign(symbol_usdt=df["symbol"].astype(str).str.upper() + "USDT") \
+                .rename(columns={"symbol_usdt": "symbol"})
+    df_norm = normalize_by_mcap(df_norm, MCAP_USD, col="vol_delta")  # adds 'vol_delta_norm'
+
+    # Which column to sort/plot
+    value_col = "vol_delta" if rank_mode.startswith("Raw") else "vol_delta_norm"
+
+    # ───────── Latest row per symbol table ─────────
     latest = (
-        df.sort_values(["symbol", "timestamp"])
-          .groupby("symbol", as_index=False)
-          .tail(1)
-          .sort_values("symbol")
+        df_norm.sort_values(["symbol", "timestamp"])
+               .groupby("symbol", as_index=False)
+               .tail(1)
+               .sort_values(value_col, ascending=False)
     )
-    st.caption("Latest bar per symbol")
-    st.dataframe(latest, use_container_width=True, hide_index=True)
+    st.caption(f"Latest bar per symbol (ranked by {value_col})")
 
-    # Chart: Top-N by |vol_delta| at latest bar
-    st.plotly_chart(vol_delta_top_bar(df, top_n=top_n), use_container_width=True)
+    cols_to_show: list[str] = ["symbol", "timestamp", "close", "volume", "vol_delta"]
+    if "vol_delta_norm" in latest.columns:
+        cols_to_show.append("vol_delta_norm")
 
-    # About
-    with st.expander("About vDelta"):
+    st.dataframe(latest[cols_to_show], use_container_width=True, hide_index=True)
+
+    # ───────── Chart: Top-N by |metric| ─────────
+    bar_df = df_norm.rename(columns={value_col: "metric"})
+    st.plotly_chart(
+        vol_delta_top_bar(bar_df, value_col="metric", top_n=top_n,
+                          title=f"Top |{value_col}| (latest)"),
+        use_container_width=True,
+    )
+
+    # ───────── About ─────────
+    with st.expander("About"):
         st.write(
-            "Current proxy uses percent change of volume per symbol. "
-            "Live taker-signed vDelta from trade streams and market-cap normalization are planned next."
+            "- **vol_delta** here is a proxy (percent change of volume per symbol).\n"
+            "- **vol_delta_norm** divides that by market cap for fair cross-coin comparison.\n"
+            "- Next steps: z-score toggle, spaghetti history, and live taker-signed vΔ."
         )
