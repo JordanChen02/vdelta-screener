@@ -1,5 +1,7 @@
 import time
 
+import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
@@ -33,21 +35,19 @@ def start_ws_if_needed(symbols):
 def render_screener():
     # Smooth auto-refresh: once per 1 second
     st_autorefresh(interval=1000, key="live_refresh")
+    # --- Ensure session_state keys exist ---
+    if "collector" not in st.session_state:
+        st.session_state.collector = None
+
+    if "flow_history" not in st.session_state:
+        st.session_state.flow_history = pd.DataFrame()
 
     st.title("Rotation Screener (Live - Binance)")
     st.caption("vDelta from WebSocket trade stream")
 
     # ---- Sidebar ----
-    symbols_raw = st.sidebar.text_input("Symbols (comma-separated)", "BTC,ETH,SOL")
+    symbols_raw = st.sidebar.text_input("Symbols (comma-separated)", "BTC,ETH,SOL,HYPE")
     symbols = [s.strip().upper() + "USDT" for s in symbols_raw.split(",")]
-
-    top_n = st.sidebar.number_input("Top-N", min_value=1, max_value=50, value=10)
-
-    rank_mode = st.sidebar.radio(
-        "Rank by",
-        ["Raw (vol_delta)", "Normalized (vol_delta_norm)"],
-        index=0,
-    )
 
     if st.sidebar.button("Clear Cached WebSocket"):
         st.session_state.collector = None
@@ -96,17 +96,112 @@ def render_screener():
         use_container_width=True,
     )
 
-    # ---- Choose ranking metric ----
-    if rank_mode == "Raw (vol_delta)":
-        value_col = "vol_delta"
-    else:
-        value_col = "vol_delta_norm"
+    # ============================================================
+    #              FLOW SHARE CALCULATION (CORRECTED)
+    # ============================================================
 
-    # ---- Top movers ----
-    top = latest.sort_values(value_col, ascending=False).head(top_n)
+    # df already has:
+    #   vdelta_notional
+    #   avg_1s_notional
+    #   vdelta_eff  <-- our normalized flow-momentum metric
 
-    st.subheader(f"Top Symbols by |{value_col}| (latest bar)")
-    st.bar_chart(data=top, x="symbol", y=value_col, use_container_width=True)
+    # 1. Keep only symbols with liquidity baseline
+    valid = df[df["avg_1s_notional"] > 0].copy()
+
+    if valid.empty:
+        st.warning("No recent trades — cannot compute rotation.")
+        return
+
+    # 2. Extract rotation momentum (efficiency)
+    momentum = valid.set_index("symbol")["vdelta_eff"]
+
+    # 3. Use absolute value for rotation pressure magnitude
+    abs_momentum = momentum.abs()
+
+    # 4. Normalize → flowshare
+    flow_shares = (abs_momentum / abs_momentum.sum()).to_dict()
+    # alias to avoid NameError
+
+    # ============================================================
+    #              MAINTAIN ROLLING HISTORY (CLEAN)
+    # ============================================================
+
+    hist = st.session_state.flow_history
+
+    # latest timestamp available
+    ts = df["timestamp"].max()
+
+    # build one row with flowshare values
+    row = {"timestamp": ts}
+    for sym in symbols:
+        row[sym] = flow_shares.get(sym, 0.0)
+
+    # append + keep last 120 seconds
+    hist = pd.concat([hist, pd.DataFrame([row])], ignore_index=True)
+    hist = hist.tail(120)
+
+    st.session_state.flow_history = hist
+
+    # ============================================================
+    #          SIDE-BY-SIDE CHARTS (STACKED BAR + SPAGHETTI)
+    # ============================================================
+    col1, col2 = st.columns(2)
+
+    # ----------------------
+    # COLORS
+    # ----------------------
+    COLORS = {
+        "BTCUSDT": "#F7931A",  # BTC Orange
+        "ETHUSDT": "#7FAAF2",  # Light ETH Blue
+        "SOLUSDT": "#5B2EE8",  # Purple SOL
+        "HYPEUSDT": "#00FF87",  # neon HYPE green (official)
+    }
+
+    # -------------------------
+    #   STACKED HORIZONTAL BAR
+    # -------------------------
+    with col1:
+        st.subheader("Flowshare (Now)")
+
+        fig_now = go.Figure()
+
+        for sym in symbols:
+            fig_now.add_trace(
+                go.Bar(
+                    x=[flow_shares.get(sym, 0.0)],
+                    y=[sym],
+                    orientation="h",
+                    name=sym,
+                    marker_color=COLORS[sym],
+                    hovertemplate=f"{sym}: {flow_shares.get(sym, 0.0):.2%}<extra></extra>",
+                )
+            )
+
+        fig_now.update_layout(
+            barmode="stack",
+            height=180,
+            showlegend=True,
+            xaxis_title="Share",
+            yaxis_title="",
+            margin=dict(l=20, r=20, t=20, b=20),
+        )
+
+        st.plotly_chart(fig_now, use_container_width=True)
+
+    # -------------------------
+    #       SPAGHETTI CHART
+    # -------------------------
+    with col2:
+        st.subheader("Flow Share (Last 2 Minutes)")
+        if len(hist) > 1:
+            spaghetti = st.session_state.flow_history.set_index("timestamp")
+            st.line_chart(
+                spaghetti,
+                color=[COLORS.get(sym, "#999999") for sym in spaghetti.columns],
+                use_container_width=True,
+            )
+        else:
+            st.info("Collecting live history…")
 
 
 # REQUIRED BY app.py

@@ -15,7 +15,7 @@ import websocket  # from websocket-client
 def _combined_stream_url(symbols: List[str]) -> str:
     # Binance wants lowercase pairs. Example: btcusdt@trade
     streams = "/".join(f"{s.lower()}@trade" for s in symbols)
-    return f"wss://stream.binance.com:9443/stream?streams={quote(streams)}"
+    return f"wss://fstream.binance.com/stream?streams={quote(streams)}"
 
 
 class TradeCollector:
@@ -133,38 +133,69 @@ class TradeCollector:
 
     def snapshot(self, now: Optional[datetime] = None) -> pd.DataFrame:
         """
-        Return per-symbol vDelta snapshot for the last 'window_seconds'.
-        Columns: symbol, vdelta_qty, vdelta_notional, last_price, last_ts
+        Return per-symbol rotation metrics for the last buffer window.
+        Adds:
+        - avg_1s_notional (60s rolling baseline)
+        - vdelta_eff      (normalized rotation momentum)
         """
         if now is None:
             now = datetime.now(timezone.utc)
+
         now_ms = int(now.timestamp() * 1000)
         cutoff_ms = now_ms - self.window_seconds * 1000
+        cutoff_60s = now_ms - 60_000  # 60-second baseline
 
         rows = []
+
         with self._lock:
             for sym, dq in self._trades.items():
-                # prune and sum
-                self._prune_locked(sym, now_ms=now_ms)
+                # prune buffer for this symbol
+                self._prune_locked(sym, now_ms)
+
                 vq = 0.0
                 vn = 0.0
                 last_ts = None
-                for ts_ms, sq, sn in dq:
+
+                # For 60-second baseline
+                notional_60s = 0.0
+                count_60s = 0
+
+                for ts_ms, signed_qty, signed_notional in dq:
+                    # accumulate full-window vDelta
                     if ts_ms >= cutoff_ms:
-                        vq += sq
-                        vn += sn
-                        last_ts = (
-                            ts_ms if last_ts is None or ts_ms > last_ts else last_ts
-                        )
+                        vq += signed_qty
+                        vn += signed_notional
+                        if last_ts is None or ts_ms > last_ts:
+                            last_ts = ts_ms
+
+                    # accumulate 60-second baseline
+                    if ts_ms >= cutoff_60s:
+                        notional_60s += abs(signed_notional)
+                        count_60s += 1
+
+                # compute baseline (avg per second)
+                if count_60s > 0:
+                    avg_1s_notional = notional_60s / 60.0
+                else:
+                    avg_1s_notional = 0.0
+
+                # normalized rotation metric
+                if avg_1s_notional > 0:
+                    vdelta_eff = vn / avg_1s_notional
+                else:
+                    vdelta_eff = 0.0
+
                 rows.append(
                     {
                         "symbol": sym,
-                        "vdelta_qty": vq,
-                        "vdelta_notional": vn,
-                        "last_price": self._last_price.get(sym),
                         "last_ts": pd.to_datetime(last_ts, unit="ms", utc=True)
                         if last_ts
                         else pd.NaT,
+                        "last_price": self._last_price.get(sym),
+                        "vdelta_qty": vq,
+                        "vdelta_notional": vn,
+                        "avg_1s_notional": avg_1s_notional,
+                        "vdelta_eff": vdelta_eff,
                     }
                 )
 
@@ -172,21 +203,16 @@ class TradeCollector:
             return pd.DataFrame(
                 columns=[
                     "symbol",
+                    "last_ts",
+                    "last_price",
                     "vdelta_qty",
                     "vdelta_notional",
-                    "last_price",
-                    "last_ts",
+                    "avg_1s_notional",
+                    "vdelta_eff",
                 ]
             )
-        df = pd.DataFrame(rows)
-        # stable order by absolute notional desc
-        df = df.sort_values(
-            "vdelta_notional",
-            key=lambda s: s.abs(),
-            ascending=False,
-            na_position="last",
-        )
-        return df.reset_index(drop=True)
+
+        return pd.DataFrame(rows)
 
     # ---- helpers ------------------------------------------------------------
 
