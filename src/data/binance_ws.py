@@ -1,11 +1,11 @@
 # src/data/binance_ws.py
 from __future__ import annotations
+
 import json
 import threading
-import time
-from collections import deque, defaultdict
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Deque, Tuple, List, Optional
+from collections import defaultdict, deque
+from datetime import datetime, timezone
+from typing import Deque, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import pandas as pd
@@ -153,22 +153,39 @@ class TradeCollector:
                     if ts_ms >= cutoff_ms:
                         vq += sq
                         vn += sn
-                        last_ts = ts_ms if last_ts is None or ts_ms > last_ts else last_ts
+                        last_ts = (
+                            ts_ms if last_ts is None or ts_ms > last_ts else last_ts
+                        )
                 rows.append(
                     {
                         "symbol": sym,
                         "vdelta_qty": vq,
                         "vdelta_notional": vn,
                         "last_price": self._last_price.get(sym),
-                        "last_ts": pd.to_datetime(last_ts, unit="ms", utc=True) if last_ts else pd.NaT,
+                        "last_ts": pd.to_datetime(last_ts, unit="ms", utc=True)
+                        if last_ts
+                        else pd.NaT,
                     }
                 )
 
         if not rows:
-            return pd.DataFrame(columns=["symbol", "vdelta_qty", "vdelta_notional", "last_price", "last_ts"])
+            return pd.DataFrame(
+                columns=[
+                    "symbol",
+                    "vdelta_qty",
+                    "vdelta_notional",
+                    "last_price",
+                    "last_ts",
+                ]
+            )
         df = pd.DataFrame(rows)
         # stable order by absolute notional desc
-        df = df.sort_values("vdelta_notional", key=lambda s: s.abs(), ascending=False, na_position="last")
+        df = df.sort_values(
+            "vdelta_notional",
+            key=lambda s: s.abs(),
+            ascending=False,
+            na_position="last",
+        )
         return df.reset_index(drop=True)
 
     # ---- helpers ------------------------------------------------------------

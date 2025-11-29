@@ -1,4 +1,5 @@
 import streamlit as st
+
 from src.views.screener import render_screener
 
 st.set_page_config(page_title="vDelta Screener", layout="wide")
