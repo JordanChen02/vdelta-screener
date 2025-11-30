@@ -21,7 +21,7 @@ def start_ws_if_needed(symbols):
     col = st.session_state.collector
 
     if col is None:
-        col = TradeCollector(window_seconds=300)  # 5-min rolling window
+        col = TradeCollector(window_seconds=3600)  # 1-hour rolling window
         col.start(symbols)
         st.session_state.collector = col
         time.sleep(1.0)  # allow websocket to warm up
@@ -123,6 +123,29 @@ def render_screener():
     # alias to avoid NameError
 
     # ============================================================
+    #               MULTI–TIMEFRAME ROTATION ENGINE
+    # ============================================================
+
+    def compute_rotation(df, window_sec, baseline_sec):
+        now_ts = df["timestamp"].max()
+
+        w_cut = now_ts - pd.Timedelta(seconds=window_sec)
+        b_cut = now_ts - pd.Timedelta(seconds=baseline_sec)
+
+        w_df = df[df["timestamp"] >= w_cut]
+        b_df = df[df["timestamp"] >= b_cut]
+
+        if w_df.empty or b_df.empty:
+            return None
+
+        w_m = w_df.set_index("symbol")["vdelta_eff"].abs()
+
+        if w_m.sum() == 0:
+            return None
+
+        return (w_m / w_m.sum()).to_dict()
+
+    # ============================================================
     #              MAINTAIN ROLLING HISTORY (CLEAN)
     # ============================================================
 
@@ -141,6 +164,47 @@ def render_screener():
     hist = hist.tail(120)
 
     st.session_state.flow_history = hist
+
+    # -------------------------
+    #   TIMEFRAME SELECTOR
+    # -------------------------
+    st.markdown("### Flowshare Timeframe")
+
+    tf_label = st.segmented_control(
+        "Select TF Window",
+        options=["15s", "30s", "1m", "3m", "5m"],
+        default="1m",
+    )
+
+    TF_TO_SECONDS = {
+        "15s": 15,
+        "30s": 30,
+        "1m": 60,
+        "3m": 180,
+        "5m": 300,
+    }
+
+    window_sec = TF_TO_SECONDS[tf_label]
+
+    # Compute window-specific flowshare
+    cut_ts = df["timestamp"].max() - pd.Timedelta(seconds=window_sec)
+    tf_df = df[df["timestamp"] >= cut_ts]
+
+    if tf_df.empty:
+        directional_flowshare = {sym: 0.0 for sym in symbols}
+    else:
+        # absolute totals for normalization
+        abs_tot = tf_df.set_index("symbol")["vdelta_eff"].abs().groupby(level=0).sum()
+        # signed totals
+        signed_tot = tf_df.set_index("symbol")["vdelta_eff"].groupby(level=0).sum()
+
+        if abs_tot.sum() == 0:
+            directional_flowshare = {sym: 0.0 for sym in symbols}
+        else:
+            directional_flowshare = {
+                sym: float(signed_tot.get(sym, 0.0)) / float(abs_tot.sum())
+                for sym in symbols
+            }
 
     # ============================================================
     #          SIDE-BY-SIDE CHARTS (STACKED BAR + SPAGHETTI)
@@ -161,29 +225,34 @@ def render_screener():
     #   STACKED HORIZONTAL BAR
     # -------------------------
     with col1:
-        st.subheader("Flowshare (Now)")
+        st.subheader(f"Flowshare ({tf_label})")
 
         fig_now = go.Figure()
 
         for sym in symbols:
+            val = directional_flowshare.get(sym, 0.0)
             fig_now.add_trace(
                 go.Bar(
-                    x=[flow_shares.get(sym, 0.0)],
+                    x=[val],
                     y=[sym],
                     orientation="h",
                     name=sym,
                     marker_color=COLORS[sym],
-                    hovertemplate=f"{sym}: {flow_shares.get(sym, 0.0):.2%}<extra></extra>",
+                    hovertemplate=f"{sym}: {val:.2%}<extra></extra>",
                 )
             )
 
         fig_now.update_layout(
-            barmode="stack",
-            height=180,
+            height=220,
             showlegend=True,
-            xaxis_title="Share",
+            xaxis_title="Directional Flowshare",
             yaxis_title="",
             margin=dict(l=20, r=20, t=20, b=20),
+            xaxis=dict(
+                zeroline=True,
+                zerolinewidth=2,
+                zerolinecolor="#FFFFFF",
+            ),
         )
 
         st.plotly_chart(fig_now, use_container_width=True)
