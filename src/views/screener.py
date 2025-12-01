@@ -96,6 +96,13 @@ def render_screener():
         use_container_width=True,
     )
 
+    # -----------------------------------------
+    #   MULTI-TIMEFRAME DOMINANCE TABLE
+    # -----------------------------------------
+    from src.components.dominance_table import render_dominance_table
+
+    render_dominance_table(df, symbols)
+
     # ============================================================
     #              FLOW SHARE CALCULATION (CORRECTED)
     # ============================================================
